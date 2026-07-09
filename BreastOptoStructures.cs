@@ -30,7 +30,9 @@
 //                                   with dicomType "BOLUS"; that type can only be
 //                                   created via Insert > New Bolus... in the UI).
 //                 Bolus_phys_Opt  = overlap (intersection) of Bolus_physical and
-//                                   z_Virtual_PTV (type PTV). Named "Bolus_phys_Opt"
+//                                   z_Virtual_PTV (type CONTROL, matching
+//                                   Bolus_physical so both group/sort together in
+//                                   the Structures list). Named "Bolus_phys_Opt"
 //                                   rather than "Bolus_physical_Opt" to stay within
 //                                   Eclipse's 16-character structure ID limit.
 //               Body_new is unchanged (already = Body_with_Bolus Or z_Virtual_PTV,
@@ -822,7 +824,8 @@ namespace VMS.TPS
                     // ============================================================
                     // STEP 1b (v3.0.0.31): Physical bolus optimisation structures.
                     //   Bolus_physical = copy of the physical bolus (type CONTROL).
-                    //   Bolus_phys_Opt  = overlap of Bolus_physical and z_Virtual_PTV.
+                    //   Bolus_phys_Opt  = overlap of Bolus_physical and z_Virtual_PTV
+                    //                     (type CONTROL, same as Bolus_physical).
                     //   Only created when Physical Bolus is ticked (physicalBolus != null).
                     //
                     //   NOTE: Eclipse's scripting API refuses AddStructure(dicomType:
@@ -867,7 +870,7 @@ namespace VMS.TPS
 
                             if (bolusPhysOptSeg != null)
                             {
-                                var bolusPhysOpt = GetOrCreate(_ss, "PTV", "Bolus_phys_Opt");
+                                var bolusPhysOpt = GetOrCreate(_ss, "CONTROL", "Bolus_phys_Opt");
                                 if (AssignSegmentSafely(bolusPhysOpt, bolusPhysOptSeg))
                                 {
                                     bolusPhysOpt.Color = Color.FromRgb(255, 200, 0);
