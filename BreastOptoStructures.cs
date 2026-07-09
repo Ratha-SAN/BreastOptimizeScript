@@ -180,7 +180,7 @@ namespace VMS.TPS
         // ==================================================================
         // VALUE TYPES
         // ==================================================================
-        private readonly struct OptKey : IEquatable<OptKey>
+        private struct OptKey : IEquatable<OptKey>
         {
             public double DoseGy { get; }
             public string Suffix { get; }
