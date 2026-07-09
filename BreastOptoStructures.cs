@@ -838,7 +838,24 @@ namespace VMS.TPS
                         var bolusPhysical = GetOrCreate(_ss, "CONTROL", "Bolus_physical");
                         if (physicalBolus.IsHighResolution && !bolusPhysical.IsHighResolution)
                             bolusPhysical.ConvertToHighResolution();
-                        if (AssignSegmentSafely(bolusPhysical, physicalBolus.SegmentVolume))
+
+                        bool bolusPhysicalOk;
+                        string bolusPhysicalFailReason = null;
+                        try
+                        {
+                            bolusPhysical.SegmentVolume = physicalBolus.SegmentVolume;
+                            bolusPhysicalOk = !bolusPhysical.IsEmpty;
+                            if (!bolusPhysicalOk)
+                                bolusPhysicalFailReason =
+                                    $"assignment succeeded but result is empty (source {physicalBolus.Id}.SegmentVolume may itself be empty/unset)";
+                        }
+                        catch (Exception exCopy)
+                        {
+                            bolusPhysicalOk = false;
+                            bolusPhysicalFailReason = exCopy.Message;
+                        }
+
+                        if (bolusPhysicalOk)
                         {
                             bolusPhysical.Color = Color.FromRgb(255, 165, 0);
                             LogCreated("Bolus_physical");
@@ -870,7 +887,7 @@ namespace VMS.TPS
                         else
                         {
                             _ss.RemoveStructure(bolusPhysical);
-                            _progress.AppendLine("  WARN (1b): Bolus_physical copy failed.");
+                            _progress.AppendLine($"  WARN (1b): Bolus_physical copy failed - {bolusPhysicalFailReason}");
                         }
                     }
 
