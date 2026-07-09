@@ -25,7 +25,10 @@
 //               Aborts with error if no BOLUS structure found in structure set.
 //   v3.0.0.31 – Physical Bolus optimisation structures:
 //               When Physical Bolus is ticked, Step 5 now also creates:
-//                 Bolus_physical  = copy of the found BOLUS structure (type BOLUS).
+//                 Bolus_physical  = copy of the found BOLUS structure (type CONTROL -
+//                                   Eclipse's scripting API refuses to AddStructure
+//                                   with dicomType "BOLUS"; that type can only be
+//                                   created via Insert > New Bolus... in the UI).
 //                 Bolus_phys_Opt  = overlap (intersection) of Bolus_physical and
 //                                   z_Virtual_PTV (type PTV). Named "Bolus_phys_Opt"
 //                                   rather than "Bolus_physical_Opt" to stay within
@@ -818,13 +821,21 @@ namespace VMS.TPS
 
                     // ============================================================
                     // STEP 1b (v3.0.0.31): Physical bolus optimisation structures.
-                    //   Bolus_physical = copy of the physical bolus (type BOLUS).
+                    //   Bolus_physical = copy of the physical bolus (type CONTROL).
                     //   Bolus_phys_Opt  = overlap of Bolus_physical and z_Virtual_PTV.
                     //   Only created when Physical Bolus is ticked (physicalBolus != null).
+                    //
+                    //   NOTE: Eclipse's scripting API refuses AddStructure(dicomType:
+                    //   "BOLUS", ...) - "Can not add a new structure: invalid DICOM
+                    //   type string" - BOLUS structures can only be created via
+                    //   Insert > New Bolus... in the Eclipse UI, never by script (this
+                    //   is the same reason physicalBolus itself must already exist).
+                    //   Bolus_physical is therefore type CONTROL, matching Body_new
+                    //   and the other script-created helper structures.
                     // ============================================================
                     if (physicalBolus != null)
                     {
-                        var bolusPhysical = GetOrCreate(_ss, "BOLUS", "Bolus_physical");
+                        var bolusPhysical = GetOrCreate(_ss, "CONTROL", "Bolus_physical");
                         if (physicalBolus.IsHighResolution && !bolusPhysical.IsHighResolution)
                             bolusPhysical.ConvertToHighResolution();
                         if (AssignSegmentSafely(bolusPhysical, physicalBolus.SegmentVolume))
