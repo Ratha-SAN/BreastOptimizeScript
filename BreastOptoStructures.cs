@@ -797,7 +797,7 @@ namespace VMS.TPS
                             if (subSeg != null) AssignSegmentSafely(baseSt, subSeg);
                         }
 
-                        var expSeg = SafeAsymmetricMargin(_ss, baseSt.SegmentVolume, totalMm,
+                        var expSeg = SafePerpendicularMargin(_ss, baseSt.SegmentVolume, totalMm,
                                         isLeft, _fb, tg, $"zVB_AsymExp_{req.TargetId}");
                         if (expSeg == null) continue;
 
@@ -1005,7 +1005,7 @@ namespace VMS.TPS
                             var k = new OptKey(req.DoseGy, req.Suffix);
                             if (!_zOpt.ContainsKey(k)) continue;
 
-                            var expSeg2 = SafeAsymmetricMargin(_ss, _zOpt[k].SegmentVolume,
+                            var expSeg2 = SafePerpendicularMargin(_ss, _zOpt[k].SegmentVolume,
                                             VB_PHYS_OPT_EXPAND_MM, isLeft, _fb, tg,
                                             $"zVB_PhysOptExp_{req.TargetId}");
                             if (expSeg2 == null) continue;
@@ -1595,6 +1595,67 @@ namespace VMS.TPS
                 fb?.MarkCreated(ctx + "_IsoFallback");
                 return sv.Margin(mm);
             }
+        }
+
+        // ------------------------------------------------------------------
+        // v3.0.0.33: Perpendicular-to-surface expansion, restricted to the
+        // anterior + lateral hemisphere (no posterior/inferior/superior growth).
+        //
+        // SafeAsymmetricMargin (above) shifts the surface by `mm` along fixed
+        // global axes - on a curved body surface that does NOT track the local
+        // normal, so the resulting ring's thickness varies with local surface
+        // angle instead of staying a uniform `mm` perpendicular distance.
+        //
+        // This instead takes a true isotropic margin (sv.Margin(mm), which by
+        // construction follows the local surface normal everywhere - a uniform
+        // perpendicular offset at every point), then clips away the part of
+        // that expansion that falls outside the allowed ant+lateral half-space
+        // using an axis-aligned mask built with the SAME mm. Because the
+        // farthest any point on a spherical (isotropic) offset of radius mm can
+        // reach along a single axis is mm itself, a box mask of half-width mm
+        // never clips the isotropic shape inside the allowed region - it only
+        // removes growth toward posterior/inferior/superior, exactly matching
+        // SafeAsymmetricMargin's directional intent with a geometrically
+        // correct (perpendicular) shape instead of an axis-shifted one.
+        // ------------------------------------------------------------------
+        private static SegmentVolume SafePerpendicularMargin(
+            StructureSet ss, SegmentVolume sv, double mm,
+            bool isLeft, SliceRecontourFallback fb, TempGuard tg, string ctx)
+        {
+            if (sv == null) return null;
+            if (Math.Abs(mm) < 1e-6) return sv;
+
+            SegmentVolume isoExpanded;
+            try
+            {
+                isoExpanded = sv.Margin(mm);
+            }
+            catch
+            {
+                fb?.MarkCreated(ctx + "_PerpIsoFallback");
+                return SafeAsymmetricMargin(ss, sv, mm, isLeft, fb, tg, ctx);
+            }
+
+            double x1 = isLeft ? 0 : mm;
+            double y1 = mm;
+            double x2 = isLeft ? mm : 0;
+
+            var maskMargins = new AxisAlignedMargins(
+                StructureMarginGeometry.Outer, x1, y1, 0, x2, 0, 0);
+
+            SegmentVolume mask;
+            try
+            {
+                mask = sv.AsymmetricMargin(maskMargins);
+            }
+            catch
+            {
+                fb?.MarkCreated(ctx + "_PerpMaskFallback");
+                return isoExpanded;
+            }
+
+            return SafeBoolean(ss, isoExpanded, mask, BoolOp.And, null, null, null,
+                fb, ctx + "_ClipToAntLat", tg);
         }
 
         private static bool AssignSegmentSafely(Structure target, SegmentVolume seg)
