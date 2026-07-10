@@ -797,7 +797,7 @@ namespace VMS.TPS
                             if (subSeg != null) AssignSegmentSafely(baseSt, subSeg);
                         }
 
-                        var expSeg = SafePerpendicularMargin(_ss, baseSt.SegmentVolume, totalMm,
+                        var expSeg = SafePerpendicularMargin(_ss, baseSt, ext, totalMm,
                                         isLeft, _fb, tg, $"zVB_AsymExp_{req.TargetId}");
                         if (expSeg == null) continue;
 
@@ -1005,7 +1005,7 @@ namespace VMS.TPS
                             var k = new OptKey(req.DoseGy, req.Suffix);
                             if (!_zOpt.ContainsKey(k)) continue;
 
-                            var expSeg2 = SafePerpendicularMargin(_ss, _zOpt[k].SegmentVolume,
+                            var expSeg2 = SafePerpendicularMargin(_ss, _zOpt[k], ext,
                                             VB_PHYS_OPT_EXPAND_MM, isLeft, _fb, tg,
                                             $"zVB_PhysOptExp_{req.TargetId}");
                             if (expSeg2 == null) continue;
@@ -1598,64 +1598,151 @@ namespace VMS.TPS
         }
 
         // ------------------------------------------------------------------
-        // v3.0.0.33: Perpendicular-to-surface expansion, restricted to the
-        // anterior + lateral hemisphere (no posterior/inferior/superior growth).
+        // v3.0.0.34: Expansion whose direction is the body/skin surface's own
+        // outward normal at the point nearest the target's tip, rather than a
+        // fixed global anterior/lateral axis split.
         //
-        // SafeAsymmetricMargin (above) shifts the surface by `mm` along fixed
-        // global axes - on a curved body surface that does NOT track the local
-        // normal, so the resulting ring's thickness varies with local surface
-        // angle instead of staying a uniform `mm` perpendicular distance.
+        // Method: find the point on `target` closest to any point on `body`
+        // (the "tip"), take that nearest body-surface point, and estimate the
+        // 2D outward normal there from its neighbouring contour points on the
+        // same image slice (tangent from prev/next point, rotated 90 degrees,
+        // sign corrected to point away from that slice's contour centroid).
+        // That single unit direction is then decomposed into the codebase's
+        // existing lateral (x1/x2) and anterior (y1) AsymmetricMargin slots,
+        // scaled so their combined magnitude is exactly `mm` along the
+        // computed direction - reusing the same isLeft-driven x1-vs-x2 sign
+        // convention already relied on elsewhere in this file, just with a
+        // direction-weighted ratio instead of an even mm/mm split.
         //
-        // This instead takes a true isotropic margin (sv.Margin(mm), which by
-        // construction follows the local surface normal everywhere - a uniform
-        // perpendicular offset at every point), then clips away the part of
-        // that expansion that falls outside the allowed ant+lateral half-space
-        // using an axis-aligned mask built with the SAME mm. Because the
-        // farthest any point on a spherical (isotropic) offset of radius mm can
-        // reach along a single axis is mm itself, a box mask of half-width mm
-        // never clips the isotropic shape inside the allowed region - it only
-        // removes growth toward posterior/inferior/superior, exactly matching
-        // SafeAsymmetricMargin's directional intent with a geometrically
-        // correct (perpendicular) shape instead of an axis-shifted one.
+        // Falls back to SafeAsymmetricMargin's even split if a tip/normal
+        // can't be determined (e.g. missing contour data).
         // ------------------------------------------------------------------
         private static SegmentVolume SafePerpendicularMargin(
-            StructureSet ss, SegmentVolume sv, double mm,
+            StructureSet ss, Structure target, Structure body, double mm,
             bool isLeft, SliceRecontourFallback fb, TempGuard tg, string ctx)
         {
-            if (sv == null) return null;
-            if (Math.Abs(mm) < 1e-6) return sv;
+            if (target == null || target.IsEmpty) return null;
+            if (Math.Abs(mm) < 1e-6) return target.SegmentVolume;
 
-            SegmentVolume isoExpanded;
+            double lateralMag = mm;
+            double anteriorMag = mm;
+
+            if (TryComputeSkinNormalAtTip(ss, target, body, out double dirX, out double dirY))
+            {
+                lateralMag = Math.Abs(dirX) * mm;
+                anteriorMag = Math.Abs(dirY) * mm;
+            }
+            else
+            {
+                fb?.MarkCreated(ctx + "_NormalFallback");
+            }
+
+            double x1 = isLeft ? 0 : lateralMag;
+            double y1 = anteriorMag;
+            double x2 = isLeft ? lateralMag : 0;
+
+            var margins = new AxisAlignedMargins(StructureMarginGeometry.Outer, x1, y1, 0, x2, 0, 0);
             try
             {
-                isoExpanded = sv.Margin(mm);
+                return target.SegmentVolume.AsymmetricMargin(margins);
             }
             catch
             {
-                fb?.MarkCreated(ctx + "_PerpIsoFallback");
-                return SafeAsymmetricMargin(ss, sv, mm, isLeft, fb, tg, ctx);
+                fb?.MarkCreated(ctx + "_IsoFallback");
+                return target.SegmentVolume.Margin(mm);
             }
+        }
 
-            double x1 = isLeft ? 0 : mm;
-            double y1 = mm;
-            double x2 = isLeft ? mm : 0;
+        // Finds the point on `target` nearest to `body`'s surface, then
+        // estimates the outward 2D (in-plane) normal of `body` at that
+        // nearest point. Returns false if either structure has no contour
+        // data to work with. All distances/directions are computed directly
+        // from raw contour coordinates - only the RATIO between dirX and
+        // dirY is used by the caller, so no assumption about which raw axis
+        // sign means "right" vs "left" is required.
+        private static bool TryComputeSkinNormalAtTip(
+            StructureSet ss, Structure target, Structure body,
+            out double dirX, out double dirY)
+        {
+            dirX = 0; dirY = 0;
+            if (ss?.Image == null || target == null || target.IsEmpty ||
+                body == null || body.IsEmpty)
+                return false;
 
-            var maskMargins = new AxisAlignedMargins(
-                StructureMarginGeometry.Outer, x1, y1, 0, x2, 0, 0);
+            int nz = ss.Image.ZSize;
+            double bestDist2 = double.MaxValue;
+            VVector bestSkinPoint = default(VVector);
+            VVector[] bestLoop = null;
+            int bestIdx = -1;
 
-            SegmentVolume mask;
-            try
+            for (int z = 0; z < nz; z++)
             {
-                mask = sv.AsymmetricMargin(maskMargins);
-            }
-            catch
-            {
-                fb?.MarkCreated(ctx + "_PerpMaskFallback");
-                return isoExpanded;
+                VVector[][] targetLoops, bodyLoops;
+                try { targetLoops = target.GetContoursOnImagePlane(z); }
+                catch { continue; }
+                if (targetLoops == null || targetLoops.Length == 0) continue;
+
+                try { bodyLoops = body.GetContoursOnImagePlane(z); }
+                catch { continue; }
+                if (bodyLoops == null || bodyLoops.Length == 0) continue;
+
+                foreach (var tLoop in targetLoops)
+                {
+                    if (tLoop == null) continue;
+                    foreach (var tp in tLoop)
+                    {
+                        foreach (var bLoop in bodyLoops)
+                        {
+                            if (bLoop == null || bLoop.Length < 3) continue;
+                            for (int i = 0; i < bLoop.Length; i++)
+                            {
+                                double dx = bLoop[i].x - tp.x;
+                                double dy = bLoop[i].y - tp.y;
+                                double d2 = dx * dx + dy * dy;
+                                if (d2 < bestDist2)
+                                {
+                                    bestDist2 = d2;
+                                    bestSkinPoint = bLoop[i];
+                                    bestLoop = bLoop;
+                                    bestIdx = i;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
-            return SafeBoolean(ss, isoExpanded, mask, BoolOp.And, null, null, null,
-                fb, ctx + "_ClipToAntLat", tg);
+            if (bestLoop == null || bestIdx < 0) return false;
+
+            int n = bestLoop.Length;
+            var prev = bestLoop[(bestIdx - 1 + n) % n];
+            var next = bestLoop[(bestIdx + 1) % n];
+            double tangentX = next.x - prev.x;
+            double tangentY = next.y - prev.y;
+
+            double normX = tangentY;
+            double normY = -tangentX;
+            double len = Math.Sqrt(normX * normX + normY * normY);
+            if (len < 1e-6) return false;
+            normX /= len;
+            normY /= len;
+
+            double cx = 0, cy = 0;
+            foreach (var p in bestLoop) { cx += p.x; cy += p.y; }
+            cx /= n;
+            cy /= n;
+
+            double toPointX = bestSkinPoint.x - cx;
+            double toPointY = bestSkinPoint.y - cy;
+            if (normX * toPointX + normY * toPointY < 0)
+            {
+                normX = -normX;
+                normY = -normY;
+            }
+
+            dirX = normX;
+            dirY = normY;
+            return true;
         }
 
         private static bool AssignSegmentSafely(Structure target, SegmentVolume seg)
