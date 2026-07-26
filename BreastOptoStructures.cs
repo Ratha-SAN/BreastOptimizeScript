@@ -52,6 +52,26 @@
 //               The original 5-step rawBolus/skin-crop pipeline (Body_with_Bolus,
 //               VB_SKIN_CROP_MM, VB_OPT_SKIN_CROP_MM, VB_OPT_INWARD_MM) still
 //               runs unchanged when Physical Bolus is NOT ticked.
+//   v3.1.0.0  – Added "RCC" tab (independent, additive – the original single-tab
+//               UI/workflow described above is unchanged and lives in the
+//               "Breast Optimiser" tab). RCC implements the "RCC Optimization
+//               Cropping Method" clinical cheat sheet formulas as a second,
+//               self-contained logic engine operating on its own target/OAR
+//               selections inside the same dialog:
+//                 - zPTV Opti      : %Diff = (Rx-OARMax)/Rx*100, Crop = %Diff/ZoneA
+//                                    (strict Max-Dose OAR sparing crop).
+//                 - SIB shave      : %Diff = (RxHigh-RxLow)/RxHigh*100, Crop = %Diff/ZoneB
+//                                    (zPTV{Low}_Opti = PTVLow Sub PTVHigh+Crop).
+//                 - z-ring_sib1/2  : rings at the 85%/65% isodose of the lowest
+//                                    ticked Rx, built per-level at ZoneB/ZoneC
+//                                    falloff (ring1 floor 3.0mm), non-overlapping
+//                                    shells (ring2 sits outside ring1).
+//                 - zOAR-in-PTV1/2 : 2mm/4mm nested shells of OAR-in-Prv overlap
+//                                    for iterative nested-ring sparing, plus a
+//                                    fully-subtracted zPTV Opti per target/OAR pair.
+//               See RCC constants/classes/methods below (all new; nothing in the
+//               original Script.Execute / StructureProcessor / OptimisationStructureWindow
+//               original-tab code paths was modified).
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -75,8 +95,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("3.0.0.31")]
-[assembly: AssemblyFileVersion("3.0.0.31")]
+[assembly: AssemblyVersion("3.1.0.0")]
+[assembly: AssemblyFileVersion("3.1.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -101,6 +121,18 @@ namespace VMS.TPS
         private const double VB_PHYS_OPT_EXPAND_MM = 4.0;  // ant+lat expansion of z_PTV_opt for z_Virtual_PTV_Opt (physical bolus mode)
 
         private static readonly double[] PhysicalBolusThicknessOptionsMm = { 5.0, 10.0, 15.0, 20.0 };
+
+        // ---------------------------------------------------------------
+        // RCC LOGIC ENGINE CONFIG
+        // "PTV Cropping & Optimization Formulas" clinical cheat sheet, v1.0
+        // ---------------------------------------------------------------
+        private const double RCC_ZONE_A_DEFAULT_PCT_PER_MM = 10.0; // High-priority OAR max-dose crop falloff
+        private const double RCC_ZONE_B_DEFAULT_PCT_PER_MM = 5.0;  // SIB shave / z-ring sib1 falloff
+        private const double RCC_ZONE_C_DEFAULT_PCT_PER_MM = 2.7;  // z-ring sib2 (far-target) falloff
+        private const double RCC_RING1_ISO_FRACTION = 0.85;        // z-ring sib1 target = 85% x lowest ticked Rx
+        private const double RCC_RING2_ISO_FRACTION = 0.65;        // z-ring sib2 target = 65% x lowest ticked Rx
+        private const double RCC_RING1_MIN_CROP_MM = 3.0;          // z-ring sib1 minimum crop distance
+        private const double RCC_NESTED_RING_STEP_MM = 2.0;        // zOAR-in-PTV1/2 shell thickness
 
         private const bool SMOOTH_OPT_TARGET = true;
         private const double SMOOTH_MM = 3.0;
@@ -2255,6 +2287,126 @@ namespace VMS.TPS
         }
 
         // ==================================================================
+        // RCC GUI MODEL + DATA CLASSES
+        // (independent of UiModel/TargetDoseRow/OrganRow above – the RCC tab
+        // keeps its own target/OAR selections rather than reusing the
+        // original tab's rows, so nothing above this point is touched)
+        // ==================================================================
+        private sealed class RccTargetRow : INotifyPropertyChanged
+        {
+            private bool _isSelected;
+            private string _rxGy;
+
+            public string TargetId { get; set; }
+
+            public bool IsSelected
+            {
+                get => _isSelected;
+                set { if (_isSelected != value) { _isSelected = value; OnPC(nameof(IsSelected)); } }
+            }
+
+            public string RxGy
+            {
+                get => _rxGy;
+                set { if (_rxGy != value) { _rxGy = value; OnPC(nameof(RxGy)); } }
+            }
+            public double? ParsedRxGy => double.TryParse(_rxGy,
+                System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : (double?)null;
+
+            public event PropertyChangedEventHandler PropertyChanged;
+            private void OnPC(string name) =>
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        }
+
+        private sealed class RccOarRow : INotifyPropertyChanged
+        {
+            private bool _cropMaxDose;
+            private bool _nestedSparing;
+            private string _maxDoseGy;
+
+            public string OarId { get; set; }
+
+            public bool CropMaxDose
+            {
+                get => _cropMaxDose;
+                set { if (_cropMaxDose != value) { _cropMaxDose = value; OnPC(nameof(CropMaxDose)); } }
+            }
+            public bool NestedSparing
+            {
+                get => _nestedSparing;
+                set { if (_nestedSparing != value) { _nestedSparing = value; OnPC(nameof(NestedSparing)); } }
+            }
+            public string MaxDoseGy
+            {
+                get => _maxDoseGy;
+                set { if (_maxDoseGy != value) { _maxDoseGy = value; OnPC(nameof(MaxDoseGy)); } }
+            }
+            public double? ParsedMaxDoseGy => double.TryParse(_maxDoseGy,
+                System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : (double?)null;
+
+            public event PropertyChangedEventHandler PropertyChanged;
+            private void OnPC(string name) =>
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        }
+
+        // Read-only preview row shown in the RCC "Computed plan" grid.
+        private sealed class RccPlanRow
+        {
+            public string Category { get; set; }
+            public string Source { get; set; }
+            public string Zone { get; set; }
+            public double PctDiff { get; set; }
+            public double CropMm { get; set; }
+            public string ResultId { get; set; }
+        }
+
+        private sealed class RccMaxDoseCrop
+        {
+            public RccTargetRow Target;
+            public RccOarRow Oar;
+            public double PctDiff;
+            public double CropMm;
+            public string ResultId;
+        }
+
+        private sealed class RccSibShave
+        {
+            public RccTargetRow High;
+            public RccTargetRow Low;
+            public double PctDiff;
+            public double CropMm;
+            public string ResultId;
+        }
+
+        private sealed class RccRingLevel
+        {
+            public RccTargetRow Target;
+            public double CropMm;
+        }
+
+        private sealed class RccNestedRing
+        {
+            public RccTargetRow Target;
+            public RccOarRow Oar;
+        }
+
+        // Single source of truth shared by the plan-preview grid and the
+        // structure-creation routine, so the numbers shown are the numbers used.
+        private sealed class RccPlan
+        {
+            public List<RccMaxDoseCrop> MaxDoseCrops = new List<RccMaxDoseCrop>();
+            public List<RccSibShave> SibShaves = new List<RccSibShave>();
+            public double? LowestSibRxGy;
+            public double Ring1TargetDoseGy;
+            public double Ring2TargetDoseGy;
+            public List<RccRingLevel> Ring1Levels = new List<RccRingLevel>();
+            public List<RccRingLevel> Ring2Levels = new List<RccRingLevel>();
+            public List<RccNestedRing> NestedRings = new List<RccNestedRing>();
+        }
+
+        // ==================================================================
         // MAIN WINDOW
         // ==================================================================
         private sealed class OptimisationStructureWindow : Window
@@ -2278,6 +2430,14 @@ namespace VMS.TPS
 
             private Style _inputTextBlockStyle;
             private Style _inputTextBoxStyle;
+
+            // ---- RCC tab state (independent of the fields above) ----
+            private List<RccTargetRow> _rccTargetRows;
+            private List<RccOarRow> _rccOarRows;
+            private RccPlan _rccPlan;
+            private DataGrid _dgRccTargets, _dgRccOars, _dgRccPlan;
+            private TextBox _txtRccZoneA, _txtRccZoneB, _txtRccZoneC;
+            private TextBlock _txtRccStats;
 
             // ----------------------------------------------------------------
             // THEME
@@ -2475,6 +2635,37 @@ namespace VMS.TPS
             </Setter.Value>
         </Setter>
     </Style>
+
+    <Style TargetType=""TabControl"">
+        <Setter Property=""Background"" Value=""Transparent"" />
+        <Setter Property=""BorderThickness"" Value=""0"" />
+    </Style>
+
+    <Style TargetType=""TabItem"">
+        <Setter Property=""Foreground"" Value=""{StaticResource TextSecondary}"" />
+        <Setter Property=""FontWeight"" Value=""SemiBold"" />
+        <Setter Property=""Padding"" Value=""18,10"" />
+        <Setter Property=""Cursor"" Value=""Hand"" />
+        <Setter Property=""Template"">
+            <Setter.Value>
+                <ControlTemplate TargetType=""TabItem"">
+                    <Border x:Name=""Bd"" Background=""{StaticResource PanelBrush}""
+                            BorderBrush=""{StaticResource BorderBrush}"" BorderThickness=""1,1,1,0""
+                            CornerRadius=""6,6,0,0"" Margin=""0,0,4,0"" Padding=""{TemplateBinding Padding}"">
+                        <ContentPresenter x:Name=""Cp"" ContentSource=""Header""
+                                          HorizontalAlignment=""Center"" VerticalAlignment=""Center"" />
+                    </Border>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property=""IsSelected"" Value=""True"">
+                            <Setter TargetName=""Bd"" Property=""Background"" Value=""{StaticResource BgBrush}"" />
+                            <Setter TargetName=""Bd"" Property=""BorderBrush"" Value=""{StaticResource AccentCyan}"" />
+                            <Setter Property=""Foreground"" Value=""{StaticResource AccentCyan}"" />
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
 </ResourceDictionary>
 ";
 
@@ -2483,7 +2674,7 @@ namespace VMS.TPS
                 _vm = vm ?? throw new ArgumentNullException(nameof(vm));
                 _ss = ss ?? throw new ArgumentNullException(nameof(ss));
 
-                Title = "Breast Optimisation Structure Generator – v3.0.0.30";
+                Title = "Breast Optimisation Structure Generator – v3.1.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -2558,7 +2749,7 @@ namespace VMS.TPS
                 foreach (var row in _vm.OrganRows)
                     row.PropertyChanged += new PropertyChangedEventHandler(rowPropertyChanged);
 
-                Content = BuildLayout(singleClickCellStyle);
+                Content = BuildRootTabs(singleClickCellStyle);
                 UpdateStructureCount();
             }
 
@@ -2693,6 +2884,24 @@ namespace VMS.TPS
                 Margin = new Thickness(5),
                 Child = content
             };
+
+            // ------------------------------------------------------------
+            // Root content = original tab (BuildLayout, unchanged below)
+            // plus the new RCC tab (BuildRccLayout).
+            // ------------------------------------------------------------
+            private UIElement BuildRootTabs(Style singleClickCellStyle)
+            {
+                var tabs = new TabControl();
+
+                var tabOriginal = new TabItem { Header = "Breast Optimiser", Content = BuildLayout(singleClickCellStyle) };
+                var tabRcc = new TabItem { Header = "RCC", Content = BuildRccLayout() };
+
+                tabs.Items.Add(tabOriginal);
+                tabs.Items.Add(tabRcc);
+                tabs.SelectedIndex = 0;
+
+                return tabs;
+            }
 
             private UIElement BuildLayout(Style singleClickCellStyle)
             {
@@ -3581,6 +3790,660 @@ namespace VMS.TPS
                 s = Regex.Replace(s, @"(?<!\d)(\d{2,4}(\.\d{1,3})?)(?!\d)", "");
                 s = Regex.Replace(s, @"[\s\-_]+", "_");
                 return s.Trim('_');
+            }
+
+            // ==================================================================
+            // RCC TAB — "RCC Optimization Cropping Method" logic engine
+            // Entirely new/additive: independent target+OAR selections, its own
+            // formula engine (ComputeRccPlan) and its own structure creation
+            // (DoRccCreate). Does not read from or write to _vm/_cropRows/etc.
+            // used by the original tab above.
+            // ==================================================================
+
+            private TextBox AddRateInput(StackPanel parent, string label, double defaultValue)
+            {
+                parent.Children.Add(new TextBlock
+                {
+                    Text = label,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Margin = new Thickness(12, 0, 4, 0)
+                });
+                var tb = new TextBox
+                {
+                    Text = defaultValue.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture),
+                    Width = 55,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                tb.LostFocus += (s, e) => RefreshRccPlan();
+                parent.Children.Add(tb);
+                return tb;
+            }
+
+            private double ParseRateOrDefault(TextBox tb, double fallback)
+            {
+                return double.TryParse(tb?.Text,
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture, out var v) && v > 0
+                    ? v : fallback;
+            }
+
+            private static double RccPctDiff(double rxHighOrRef, double comparisonDoseGy) =>
+                (rxHighOrRef - comparisonDoseGy) / rxHighOrRef * 100.0;
+
+            private static double RccCropMm(double pctDiff, double falloffRatePctPerMm) =>
+                falloffRatePctPerMm > 0 ? pctDiff / falloffRatePctPerMm : 0.0;
+
+            private UIElement BuildRccLayout()
+            {
+                _rccTargetRows = new List<RccTargetRow>();
+                foreach (var t in _vm.TargetCandidates)
+                {
+                    var guessedDose = GuessDoseFromName(t.Id);
+                    var row = new RccTargetRow
+                    {
+                        TargetId = t.Id,
+                        IsSelected = false,
+                        RxGy = guessedDose.HasValue
+                            ? guessedDose.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)
+                            : ""
+                    };
+                    row.PropertyChanged += (s, e) => RefreshRccPlan();
+                    _rccTargetRows.Add(row);
+                }
+
+                _rccOarRows = new List<RccOarRow>();
+                foreach (var o in _vm.OarCandidates)
+                {
+                    var row = new RccOarRow { OarId = o.Id, CropMaxDose = false, NestedSparing = false, MaxDoseGy = "" };
+                    row.PropertyChanged += (s, e) => RefreshRccPlan();
+                    _rccOarRows.Add(row);
+                }
+
+                var root = new Grid { Margin = new Thickness(15) };
+                root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+                root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+                root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+                // --- HEADER: title + falloff zone rates (PDF section 1) ---
+                var header = new StackPanel { Orientation = Orientation.Vertical };
+                header.Children.Add(new TextBlock
+                {
+                    Text = "RCC Optimization Cropping Method – dose-falloff-driven PTV & ring cropping",
+                    FontWeight = FontWeights.Bold,
+                    FontSize = 14,
+                    Margin = new Thickness(0, 0, 0, 4),
+                    Foreground = (Brush)FindResource("AccentCyan")
+                });
+                header.Children.Add(new TextBlock
+                {
+                    Text = "Tick targets (with Rx) and OARs below, then Refresh Plan to preview the computed crops before creating structures.",
+                    Foreground = (Brush)FindResource("TextSecondary"),
+                    Margin = new Thickness(0, 0, 0, 8),
+                    TextWrapping = TextWrapping.Wrap
+                });
+
+                var rateBar = new StackPanel { Orientation = Orientation.Horizontal };
+                rateBar.Children.Add(new TextBlock { Text = "Falloff zones:", FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center });
+                _txtRccZoneA = AddRateInput(rateBar, "Zone A – OAR max-dose crop (%/mm):", RCC_ZONE_A_DEFAULT_PCT_PER_MM);
+                _txtRccZoneB = AddRateInput(rateBar, "Zone B – SIB shave / ring1 (%/mm):", RCC_ZONE_B_DEFAULT_PCT_PER_MM);
+                _txtRccZoneC = AddRateInput(rateBar, "Zone C – ring2 (%/mm):", RCC_ZONE_C_DEFAULT_PCT_PER_MM);
+                header.Children.Add(rateBar);
+
+                var headerCard = CreateCard(header);
+                Grid.SetRow(headerCard, 0);
+                root.Children.Add(headerCard);
+
+                // --- MIDDLE: left (target/OAR inputs) + right (computed plan) ---
+                var mid = new Grid();
+                mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+                var leftStack = new StackPanel { Orientation = Orientation.Vertical };
+
+                leftStack.Children.Add(new TextBlock { Text = "Targets – tick + set Rx (Gy):", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 4) });
+                _dgRccTargets = new DataGrid
+                {
+                    ItemsSource = _rccTargetRows,
+                    AutoGenerateColumns = false,
+                    CanUserAddRows = false,
+                    HeadersVisibility = DataGridHeadersVisibility.Column,
+                    SelectionMode = DataGridSelectionMode.Extended,
+                    MaxHeight = 220
+                };
+                _dgRccTargets.Columns.Add(MakeSingleClickCheckColumn(
+                    MakeHeaderCheckbox("Use", isChecked =>
+                    {
+                        foreach (var r in _rccTargetRows) r.IsSelected = isChecked;
+                        _dgRccTargets.Items.Refresh();
+                        RefreshRccPlan();
+                    }), "IsSelected", 55));
+                _dgRccTargets.Columns.Add(new DataGridTextColumn
+                {
+                    Header = "Target",
+                    Binding = new Binding("TargetId"),
+                    IsReadOnly = true,
+                    Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                    ElementStyle = (Style)FindResource(typeof(TextBlock))
+                });
+                _dgRccTargets.Columns.Add(new DataGridTextColumn
+                {
+                    Header = "Rx (Gy)",
+                    Binding = new Binding("RxGy") { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
+                    Width = 90,
+                    ElementStyle = _inputTextBlockStyle,
+                    EditingElementStyle = _inputTextBoxStyle
+                });
+                leftStack.Children.Add(_dgRccTargets);
+
+                leftStack.Children.Add(new TextBlock { Text = "OARs – tick Max-Dose crop (§2) and/or Nested sparing (§7):", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 12, 0, 4) });
+                _dgRccOars = new DataGrid
+                {
+                    ItemsSource = _rccOarRows,
+                    AutoGenerateColumns = false,
+                    CanUserAddRows = false,
+                    HeadersVisibility = DataGridHeadersVisibility.Column,
+                    SelectionMode = DataGridSelectionMode.Extended,
+                    MaxHeight = 220
+                };
+                _dgRccOars.Columns.Add(new DataGridTextColumn
+                {
+                    Header = "OAR",
+                    Binding = new Binding("OarId"),
+                    IsReadOnly = true,
+                    Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                    ElementStyle = (Style)FindResource(typeof(TextBlock))
+                });
+                _dgRccOars.Columns.Add(MakeSingleClickCheckColumn(
+                    MakeHeaderCheckbox("Max-Dose", isChecked =>
+                    {
+                        foreach (var r in _rccOarRows) r.CropMaxDose = isChecked;
+                        _dgRccOars.Items.Refresh();
+                        RefreshRccPlan();
+                    }), "CropMaxDose", 75));
+                _dgRccOars.Columns.Add(new DataGridTextColumn
+                {
+                    Header = "Max Dose (Gy)",
+                    Binding = new Binding("MaxDoseGy") { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
+                    Width = 105,
+                    ElementStyle = _inputTextBlockStyle,
+                    EditingElementStyle = _inputTextBoxStyle
+                });
+                _dgRccOars.Columns.Add(MakeSingleClickCheckColumn(
+                    MakeHeaderCheckbox("Nested", isChecked =>
+                    {
+                        foreach (var r in _rccOarRows) r.NestedSparing = isChecked;
+                        _dgRccOars.Items.Refresh();
+                        RefreshRccPlan();
+                    }), "NestedSparing", 75));
+                leftStack.Children.Add(_dgRccOars);
+
+                var leftScroll = new ScrollViewer { Content = leftStack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
+                var leftCard = CreateCard(leftScroll);
+                Grid.SetColumn(leftCard, 0);
+                mid.Children.Add(leftCard);
+
+                var rightStack = new StackPanel { Orientation = Orientation.Vertical };
+                rightStack.Children.Add(new TextBlock { Text = "Computed plan (per cheat-sheet formulas):", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 4) });
+
+                _dgRccPlan = new DataGrid
+                {
+                    AutoGenerateColumns = false,
+                    CanUserAddRows = false,
+                    IsReadOnly = true,
+                    HeadersVisibility = DataGridHeadersVisibility.Column
+                };
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Step", Binding = new Binding("Category"), Width = 130, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Source", Binding = new Binding("Source"), Width = new DataGridLength(1, DataGridLengthUnitType.Star), ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Zone", Binding = new Binding("Zone"), Width = 45, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "%Diff", Binding = new Binding("PctDiff") { StringFormat = "0.00" }, Width = 65, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Crop (mm)", Binding = new Binding("CropMm") { StringFormat = "0.00" }, Width = 80, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Result ID", Binding = new Binding("ResultId"), Width = 135, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                rightStack.Children.Add(_dgRccPlan);
+
+                _txtRccStats = new TextBlock { Margin = new Thickness(0, 8, 0, 0), Foreground = (Brush)FindResource("TextSecondary"), TextWrapping = TextWrapping.Wrap };
+                rightStack.Children.Add(_txtRccStats);
+
+                var rightCard = CreateCard(rightStack);
+                Grid.SetColumn(rightCard, 1);
+                mid.Children.Add(rightCard);
+
+                Grid.SetRow(mid, 1);
+                root.Children.Add(mid);
+
+                // --- BOTTOM: action buttons ---
+                var bottom = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+
+                var btnRefresh = new Button { Content = "Refresh Plan", Padding = new Thickness(15, 6, 15, 6), Margin = new Thickness(0, 0, 6, 0) };
+                btnRefresh.Click += (s, e) => RefreshRccPlan();
+                bottom.Children.Add(btnRefresh);
+
+                var btnCreate = new Button { Content = "Create RCC Structures", Padding = new Thickness(20, 8, 20, 8) };
+                btnCreate.SetResourceReference(FrameworkElement.StyleProperty, "PrimaryButton");
+                btnCreate.Click += (s, e) => DoRccCreate();
+                bottom.Children.Add(btnCreate);
+
+                var bottomCard = CreateCard(bottom);
+                Grid.SetRow(bottomCard, 2);
+                root.Children.Add(bottomCard);
+
+                RefreshRccPlan();
+                return root;
+            }
+
+            // Recomputes the RCC plan from current ticks/Rx/MaxDose/zone-rate inputs
+            // and repopulates the read-only preview grid. Called on every relevant
+            // edit so the preview always matches what "Create RCC Structures" will do.
+            private void RefreshRccPlan()
+            {
+                if (_dgRccPlan == null) return;
+
+                _dgRccTargets?.CommitEdit(DataGridEditingUnit.Cell, true);
+                _dgRccTargets?.CommitEdit(DataGridEditingUnit.Row, true);
+                _dgRccOars?.CommitEdit(DataGridEditingUnit.Cell, true);
+                _dgRccOars?.CommitEdit(DataGridEditingUnit.Row, true);
+
+                _rccPlan = ComputeRccPlan();
+                var rows = new List<RccPlanRow>();
+
+                foreach (var c in _rccPlan.MaxDoseCrops)
+                    rows.Add(new RccPlanRow
+                    {
+                        Category = "zPTV Opti (§2)",
+                        Source = $"{c.Target.TargetId} vs {c.Oar.OarId} (max {c.Oar.ParsedMaxDoseGy:0.##} Gy)",
+                        Zone = "A",
+                        PctDiff = c.PctDiff,
+                        CropMm = c.CropMm,
+                        ResultId = c.ResultId
+                    });
+
+                foreach (var sh in _rccPlan.SibShaves)
+                    rows.Add(new RccPlanRow
+                    {
+                        Category = "SIB shave (§3)",
+                        Source = $"{sh.Low.TargetId} shaved from {sh.High.TargetId}",
+                        Zone = "B",
+                        PctDiff = sh.PctDiff,
+                        CropMm = sh.CropMm,
+                        ResultId = sh.ResultId
+                    });
+
+                foreach (var lvl in _rccPlan.Ring1Levels)
+                    rows.Add(new RccPlanRow
+                    {
+                        Category = "z-ring sib1 (§4)",
+                        Source = $"from {lvl.Target.TargetId} (target {_rccPlan.Ring1TargetDoseGy:0.##} Gy = 85% x {_rccPlan.LowestSibRxGy:0.##} Gy)",
+                        Zone = "B",
+                        PctDiff = 0,
+                        CropMm = lvl.CropMm,
+                        ResultId = "z-ring_sib1"
+                    });
+
+                foreach (var lvl in _rccPlan.Ring2Levels)
+                    rows.Add(new RccPlanRow
+                    {
+                        Category = "z-ring sib2 (§5)",
+                        Source = $"from {lvl.Target.TargetId} (target {_rccPlan.Ring2TargetDoseGy:0.##} Gy = 65% x {_rccPlan.LowestSibRxGy:0.##} Gy)",
+                        Zone = "C",
+                        PctDiff = 0,
+                        CropMm = lvl.CropMm,
+                        ResultId = "z-ring_sib2"
+                    });
+
+                foreach (var nr in _rccPlan.NestedRings)
+                {
+                    rows.Add(new RccPlanRow { Category = "zPTV Opti (§7 full)", Source = $"{nr.Target.TargetId} minus {nr.Oar.OarId}", Zone = "-", PctDiff = 0, CropMm = 0, ResultId = TruncId($"z{nr.Target.TargetId}_Opti") });
+                    rows.Add(new RccPlanRow { Category = "zOAR-in-PTV1 (§7)", Source = $"{nr.Oar.OarId} ∩ {nr.Target.TargetId}, 0-2mm shell", Zone = "-", PctDiff = 0, CropMm = RCC_NESTED_RING_STEP_MM, ResultId = "zOAR-in-PTV1" });
+                    rows.Add(new RccPlanRow { Category = "zOAR-in-PTV2 (§7)", Source = $"{nr.Oar.OarId} ∩ {nr.Target.TargetId}, 2-4mm shell", Zone = "-", PctDiff = 0, CropMm = 2.0 * RCC_NESTED_RING_STEP_MM, ResultId = "zOAR-in-PTV2" });
+                }
+
+                _dgRccPlan.ItemsSource = rows;
+
+                _txtRccStats.Text = $"Planned rows: {rows.Count}" +
+                    (_rccPlan.LowestSibRxGy.HasValue
+                        ? $"   |   Ring1 target dose = {_rccPlan.Ring1TargetDoseGy:0.##} Gy (85% x {_rccPlan.LowestSibRxGy:0.##} Gy)   |   Ring2 target dose = {_rccPlan.Ring2TargetDoseGy:0.##} Gy (65% x {_rccPlan.LowestSibRxGy:0.##} Gy)"
+                        : "");
+            }
+
+            // Pure formula engine – no ESAPI calls here, only the PDF cheat-sheet math.
+            private RccPlan ComputeRccPlan()
+            {
+                var plan = new RccPlan();
+                double zoneA = ParseRateOrDefault(_txtRccZoneA, RCC_ZONE_A_DEFAULT_PCT_PER_MM);
+                double zoneB = ParseRateOrDefault(_txtRccZoneB, RCC_ZONE_B_DEFAULT_PCT_PER_MM);
+                double zoneC = ParseRateOrDefault(_txtRccZoneC, RCC_ZONE_C_DEFAULT_PCT_PER_MM);
+
+                var selTargets = _rccTargetRows
+                    .Where(r => r.IsSelected && r.ParsedRxGy.HasValue && r.ParsedRxGy.Value > 0)
+                    .ToList();
+
+                // Section 2: zPTV Opti (strict Max-Dose OAR sparing crop), Zone A.
+                foreach (var oar in _rccOarRows.Where(o => o.CropMaxDose && o.ParsedMaxDoseGy.HasValue))
+                {
+                    foreach (var t in selTargets)
+                    {
+                        double rx = t.ParsedRxGy.Value;
+                        double oarMax = oar.ParsedMaxDoseGy.Value;
+                        if (oarMax >= rx) continue;
+
+                        double pctDiff = RccPctDiff(rx, oarMax);
+                        double cropMm = RccCropMm(pctDiff, zoneA);
+                        if (cropMm <= 0) continue;
+
+                        plan.MaxDoseCrops.Add(new RccMaxDoseCrop
+                        {
+                            Target = t,
+                            Oar = oar,
+                            PctDiff = pctDiff,
+                            CropMm = cropMm,
+                            ResultId = TruncId($"z{t.TargetId}_Opti")
+                        });
+                    }
+                }
+
+                // Sections 3-5: SIB ladder shave + variable rings, Zone B / Zone C.
+                var sibSorted = selTargets.OrderByDescending(t => t.ParsedRxGy.Value).ToList();
+                for (int i = 0; i < sibSorted.Count - 1; i++)
+                {
+                    var high = sibSorted[i];
+                    var low = sibSorted[i + 1];
+                    double rxHigh = high.ParsedRxGy.Value;
+                    double rxLow = low.ParsedRxGy.Value;
+                    double pctDiff = RccPctDiff(rxHigh, rxLow);
+                    double cropMm = RccCropMm(pctDiff, zoneB);
+
+                    plan.SibShaves.Add(new RccSibShave
+                    {
+                        High = high,
+                        Low = low,
+                        PctDiff = pctDiff,
+                        CropMm = cropMm,
+                        ResultId = TruncId($"z{low.TargetId}_Opti")
+                    });
+                }
+
+                if (sibSorted.Count > 0)
+                {
+                    double lowestRx = sibSorted[sibSorted.Count - 1].ParsedRxGy.Value;
+                    plan.LowestSibRxGy = lowestRx;
+                    plan.Ring1TargetDoseGy = RCC_RING1_ISO_FRACTION * lowestRx;
+                    plan.Ring2TargetDoseGy = RCC_RING2_ISO_FRACTION * lowestRx;
+
+                    foreach (var t in sibSorted)
+                    {
+                        double rx = t.ParsedRxGy.Value;
+
+                        double pctDiff1 = (rx - plan.Ring1TargetDoseGy) / rx * 100.0;
+                        double crop1 = Math.Max(RCC_RING1_MIN_CROP_MM, RccCropMm(pctDiff1, zoneB));
+                        plan.Ring1Levels.Add(new RccRingLevel { Target = t, CropMm = crop1 });
+
+                        double pctDiff2 = (rx - plan.Ring2TargetDoseGy) / rx * 100.0;
+                        double crop2 = Math.Max(0.0, RccCropMm(pctDiff2, zoneC));
+                        plan.Ring2Levels.Add(new RccRingLevel { Target = t, CropMm = crop2 });
+                    }
+                }
+
+                // Section 7: iterative nested-ring sparing (OAR mean-dose overlap).
+                foreach (var oar in _rccOarRows.Where(o => o.NestedSparing))
+                    foreach (var t in selTargets)
+                        plan.NestedRings.Add(new RccNestedRing { Target = t, Oar = oar });
+
+                return plan;
+            }
+
+            // Executes the current RccPlan against the live StructureSet.
+            private void DoRccCreate()
+            {
+                RefreshRccPlan();
+                var plan = _rccPlan;
+                if (plan == null) return;
+
+                var ext = _vm.SelectedExternal ?? FindExternalFallback(_ss);
+                if (ext == null || ext.IsEmpty)
+                {
+                    MessageBox.Show(this, "No External/Body structure selected.",
+                        "Missing External", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                if (plan.MaxDoseCrops.Count == 0 && plan.SibShaves.Count == 0 &&
+                    plan.Ring1Levels.Count == 0 && plan.NestedRings.Count == 0)
+                {
+                    MessageBox.Show(this,
+                        "Nothing to create – tick targets/OARs and set Rx / Max Dose values first.",
+                        "Nothing selected", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                var fb = new SliceRecontourFallback();
+                var created = new List<string>();
+                var errors = new List<string>();
+
+                // ---- Section 2: zPTV Opti (Max-Dose OAR crop) ----
+                foreach (var c in plan.MaxDoseCrops)
+                {
+                    try
+                    {
+                        var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, c.Target.TargetId, StringComparison.OrdinalIgnoreCase));
+                        var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, c.Oar.OarId, StringComparison.OrdinalIgnoreCase));
+                        if (targetSt == null || oarSt == null) { errors.Add($"{c.ResultId}: source structure missing"); continue; }
+
+                        using (var tg = new TempGuard(_ss))
+                        {
+                            var expandedOar = SafeMargin(oarSt.SegmentVolume, c.CropMm);
+                            var expandedOarSt = tg.Add(CreateTempFromSegment(_ss, expandedOar, "zRCC_ExpOar"));
+
+                            var croppedSeg = SafeBoolean(_ss, targetSt.SegmentVolume, expandedOar, BoolOp.Sub,
+                                targetSt, expandedOarSt, c.ResultId, fb, $"RccOpti_{c.ResultId}_Sub", tg);
+                            croppedSeg = SafeBoolean(_ss, croppedSeg, ext.SegmentVolume, BoolOp.And,
+                                null, ext, c.ResultId, fb, $"RccOpti_{c.ResultId}_CapExt", tg);
+
+                            var st = GetOrCreate(_ss, "PTV", c.ResultId);
+                            if (AssignSegmentSafely(st, croppedSeg))
+                            {
+                                st.Color = Color.FromRgb(255, 165, 0);
+                                created.Add(c.ResultId);
+                            }
+                            else
+                            {
+                                _ss.RemoveStructure(st);
+                                errors.Add($"{c.ResultId}: empty result");
+                            }
+                        }
+                    }
+                    catch (Exception ex) { errors.Add($"{c.ResultId}: {ex.Message}"); }
+                }
+
+                // ---- Section 3: SIB shave (zPTVLow Opti) ----
+                foreach (var sh in plan.SibShaves)
+                {
+                    try
+                    {
+                        var lowSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, sh.Low.TargetId, StringComparison.OrdinalIgnoreCase));
+                        var highSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, sh.High.TargetId, StringComparison.OrdinalIgnoreCase));
+                        if (lowSt == null || highSt == null) { errors.Add($"{sh.ResultId}: source structure missing"); continue; }
+
+                        using (var tg = new TempGuard(_ss))
+                        {
+                            var expandedHigh = SafeMargin(highSt.SegmentVolume, sh.CropMm);
+                            var expandedHighSt = tg.Add(CreateTempFromSegment(_ss, expandedHigh, "zRCC_ExpHigh"));
+
+                            var shavedSeg = SafeBoolean(_ss, lowSt.SegmentVolume, expandedHigh, BoolOp.Sub,
+                                lowSt, expandedHighSt, sh.ResultId, fb, $"RccShave_{sh.ResultId}_Sub", tg);
+                            shavedSeg = SafeBoolean(_ss, shavedSeg, ext.SegmentVolume, BoolOp.And,
+                                null, ext, sh.ResultId, fb, $"RccShave_{sh.ResultId}_CapExt", tg);
+
+                            var st = GetOrCreate(_ss, "PTV", sh.ResultId);
+                            if (AssignSegmentSafely(st, shavedSeg))
+                            {
+                                st.Color = Color.FromRgb(255, 140, 0);
+                                created.Add(sh.ResultId);
+                            }
+                            else
+                            {
+                                _ss.RemoveStructure(st);
+                                errors.Add($"{sh.ResultId}: empty result");
+                            }
+                        }
+                    }
+                    catch (Exception ex) { errors.Add($"{sh.ResultId}: {ex.Message}"); }
+                }
+
+                // ---- Sections 4-5: z-ring sib1 / z-ring sib2 (non-overlapping shells) ----
+                if (plan.Ring1Levels.Count > 0)
+                {
+                    try
+                    {
+                        using (var tg = new TempGuard(_ss))
+                        {
+                            var ring1ExpandedTemps = new List<Structure>();
+                            var rawTargetTemps = new List<Structure>();
+
+                            foreach (var lvl in plan.Ring1Levels)
+                            {
+                                var st = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, lvl.Target.TargetId, StringComparison.OrdinalIgnoreCase));
+                                if (st == null) continue;
+                                var expanded = SafeMargin(st.SegmentVolume, lvl.CropMm);
+                                ring1ExpandedTemps.Add(tg.Add(CreateTempFromSegment(_ss, expanded, "zRCC_R1Exp")));
+                                rawTargetTemps.Add(tg.Add(CreateTempFromSegment(_ss, st.SegmentVolume, "zRCC_RawT")));
+                            }
+
+                            var ring1OuterSt = tg.Add(UnionManyToTemp(_ss, ring1ExpandedTemps, fb, "zRCC_R1U", "Ring1Union", tg));
+                            var rawUnionSt = tg.Add(UnionManyToTemp(_ss, rawTargetTemps, fb, "zRCC_RawU", "Ring1RawUnion", tg));
+
+                            if (ring1OuterSt != null && rawUnionSt != null)
+                            {
+                                var ring1Seg = SafeBoolean(_ss, ring1OuterSt.SegmentVolume, rawUnionSt.SegmentVolume, BoolOp.Sub,
+                                    ring1OuterSt, rawUnionSt, "z-ring_sib1", fb, "Ring1_SubRaw", tg);
+                                ring1Seg = SafeBoolean(_ss, ring1Seg, ext.SegmentVolume, BoolOp.And,
+                                    null, ext, "z-ring_sib1", fb, "Ring1_CapExt", tg);
+
+                                var ring1St = GetOrCreate(_ss, "CONTROL", "z-ring_sib1");
+                                if (AssignSegmentSafely(ring1St, ring1Seg)) { ring1St.Color = Colors.MediumPurple; created.Add("z-ring_sib1"); }
+                                else { _ss.RemoveStructure(ring1St); errors.Add("z-ring_sib1: empty result"); }
+
+                                if (plan.Ring2Levels.Count > 0)
+                                {
+                                    var ring2ExpandedTemps = new List<Structure>();
+                                    foreach (var lvl in plan.Ring2Levels)
+                                    {
+                                        var st = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, lvl.Target.TargetId, StringComparison.OrdinalIgnoreCase));
+                                        if (st == null) continue;
+                                        var expanded = SafeMargin(st.SegmentVolume, lvl.CropMm);
+                                        ring2ExpandedTemps.Add(tg.Add(CreateTempFromSegment(_ss, expanded, "zRCC_R2Exp")));
+                                    }
+
+                                    var ring2OuterSt = tg.Add(UnionManyToTemp(_ss, ring2ExpandedTemps, fb, "zRCC_R2U", "Ring2Union", tg));
+                                    if (ring2OuterSt != null)
+                                    {
+                                        var ring2Seg = SafeBoolean(_ss, ring2OuterSt.SegmentVolume, ring1OuterSt.SegmentVolume, BoolOp.Sub,
+                                            ring2OuterSt, ring1OuterSt, "z-ring_sib2", fb, "Ring2_SubRing1", tg);
+                                        ring2Seg = SafeBoolean(_ss, ring2Seg, ext.SegmentVolume, BoolOp.And,
+                                            null, ext, "z-ring_sib2", fb, "Ring2_CapExt", tg);
+
+                                        var ring2St = GetOrCreate(_ss, "CONTROL", "z-ring_sib2");
+                                        if (AssignSegmentSafely(ring2St, ring2Seg)) { ring2St.Color = Colors.SlateBlue; created.Add("z-ring_sib2"); }
+                                        else { _ss.RemoveStructure(ring2St); errors.Add("z-ring_sib2: empty result"); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex) { errors.Add($"z-ring sib1/2: {ex.Message}"); }
+                }
+
+                // ---- Section 7: nested OAR-in-PTV sparing rings + full-crop zPTV Opti ----
+                if (plan.NestedRings.Count > 0)
+                {
+                    try
+                    {
+                        using (var tg = new TempGuard(_ss))
+                        {
+                            var ring1Pieces = new List<Structure>();
+                            var ring2Pieces = new List<Structure>();
+
+                            foreach (var nr in plan.NestedRings)
+                            {
+                                var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Target.TargetId, StringComparison.OrdinalIgnoreCase));
+                                var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Oar.OarId, StringComparison.OrdinalIgnoreCase));
+                                if (targetSt == null || oarSt == null) { errors.Add($"{nr.Target.TargetId}/{nr.Oar.OarId}: source structure missing"); continue; }
+
+                                string fullId = TruncId($"z{nr.Target.TargetId}_Opti");
+                                var fullSeg = SafeBoolean(_ss, targetSt.SegmentVolume, oarSt.SegmentVolume, BoolOp.Sub,
+                                    targetSt, oarSt, fullId, fb, $"RccNestedFull_{fullId}", tg);
+                                fullSeg = SafeBoolean(_ss, fullSeg, ext.SegmentVolume, BoolOp.And,
+                                    null, ext, fullId, fb, $"RccNestedFull_{fullId}_CapExt", tg);
+
+                                var fullSt = GetOrCreate(_ss, "PTV", fullId);
+                                if (AssignSegmentSafely(fullSt, fullSeg)) { fullSt.Color = Color.FromRgb(255, 99, 71); created.Add(fullId); }
+                                else { _ss.RemoveStructure(fullSt); errors.Add($"{fullId}: empty result"); }
+
+                                var overlap = SafeBoolean(_ss, oarSt.SegmentVolume, targetSt.SegmentVolume, BoolOp.And,
+                                    oarSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Overlap", tg);
+                                if (overlap == null) continue;
+                                var overlapSt = tg.Add(CreateTempFromSegment(_ss, overlap, "zRCC_Ovl"));
+
+                                var shell1Base = SafeMargin(oarSt.SegmentVolume, -RCC_NESTED_RING_STEP_MM);
+                                var shell1BaseSt = tg.Add(CreateTempFromSegment(_ss, shell1Base, "zRCC_S1B"));
+                                var shell1 = SafeBoolean(_ss, shell1Base, targetSt.SegmentVolume, BoolOp.And,
+                                    shell1BaseSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Shell1", tg);
+
+                                if (shell1 == null) continue;
+                                var shell1St = tg.Add(CreateTempFromSegment(_ss, shell1, "zRCC_S1"));
+
+                                var ring1Piece = SafeBoolean(_ss, overlap, shell1, BoolOp.Sub,
+                                    overlapSt, shell1St, null, fb, $"RccNested_{nr.Oar.OarId}_Ring1", tg);
+                                if (ring1Piece != null) ring1Pieces.Add(tg.Add(CreateTempFromSegment(_ss, ring1Piece, "zRCC_R1P")));
+
+                                var shell2Base = SafeMargin(oarSt.SegmentVolume, -2.0 * RCC_NESTED_RING_STEP_MM);
+                                var shell2BaseSt = tg.Add(CreateTempFromSegment(_ss, shell2Base, "zRCC_S2B"));
+                                var shell2 = SafeBoolean(_ss, shell2Base, targetSt.SegmentVolume, BoolOp.And,
+                                    shell2BaseSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Shell2", tg);
+
+                                if (shell2 != null)
+                                {
+                                    var shell2St = tg.Add(CreateTempFromSegment(_ss, shell2, "zRCC_S2"));
+                                    var ring2Piece = SafeBoolean(_ss, shell1, shell2, BoolOp.Sub,
+                                        shell1St, shell2St, null, fb, $"RccNested_{nr.Oar.OarId}_Ring2", tg);
+                                    if (ring2Piece != null) ring2Pieces.Add(tg.Add(CreateTempFromSegment(_ss, ring2Piece, "zRCC_R2P")));
+                                }
+                            }
+
+                            if (ring1Pieces.Count > 0)
+                            {
+                                var r1Union = tg.Add(UnionManyToTemp(_ss, ring1Pieces, fb, "zRCC_R1Un", "NestedRing1Union", tg));
+                                if (r1Union != null)
+                                {
+                                    var r1 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV1");
+                                    if (AssignSegmentSafely(r1, r1Union.SegmentVolume)) { r1.Color = Colors.Gold; created.Add("zOAR-in-PTV1"); }
+                                    else { _ss.RemoveStructure(r1); errors.Add("zOAR-in-PTV1: empty result"); }
+                                }
+                            }
+                            if (ring2Pieces.Count > 0)
+                            {
+                                var r2Union = tg.Add(UnionManyToTemp(_ss, ring2Pieces, fb, "zRCC_R2Un", "NestedRing2Union", tg));
+                                if (r2Union != null)
+                                {
+                                    var r2 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV2");
+                                    if (AssignSegmentSafely(r2, r2Union.SegmentVolume)) { r2.Color = Colors.DarkGoldenrod; created.Add("zOAR-in-PTV2"); }
+                                    else { _ss.RemoveStructure(r2); errors.Add("zOAR-in-PTV2: empty result"); }
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex) { errors.Add($"zOAR-in-PTV1/2: {ex.Message}"); }
+                }
+
+                var msg = new StringBuilder();
+                msg.AppendLine($"RCC structures created/updated: {created.Count}");
+                foreach (var id in created) msg.AppendLine($"  {id}");
+                if (errors.Count > 0)
+                {
+                    msg.AppendLine();
+                    msg.AppendLine($"Errors ({errors.Count}):");
+                    foreach (var err in errors) msg.AppendLine($"  {err}");
+                }
+                MessageBox.Show(this, msg.ToString(), "RCC Structures", MessageBoxButton.OK,
+                    errors.Count > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
             }
         }
     }
