@@ -2406,6 +2406,17 @@ namespace VMS.TPS
             public List<RccNestedRing> NestedRings = new List<RccNestedRing>();
         }
 
+        // Read-only row for the "Crop Distance Matrix" grid: one row per ticked
+        // OAR, one display column per ticked target, auto-computed from
+        // Rx (target) + Max Dose (OAR) so the distance driving the auto-crop
+        // is always visible before it is used.
+        private sealed class RccMatrixRow
+        {
+            public string OarId { get; set; }
+            public string MaxDoseDisplay { get; set; }
+            public string[] CropDisplay { get; set; }
+        }
+
         // ==================================================================
         // MAIN WINDOW
         // ==================================================================
@@ -2435,7 +2446,7 @@ namespace VMS.TPS
             private List<RccTargetRow> _rccTargetRows;
             private List<RccOarRow> _rccOarRows;
             private RccPlan _rccPlan;
-            private DataGrid _dgRccTargets, _dgRccOars, _dgRccPlan;
+            private DataGrid _dgRccTargets, _dgRccOars, _dgRccMatrix, _dgRccPlan;
             private TextBox _txtRccZoneA, _txtRccZoneB, _txtRccZoneC;
             private TextBlock _txtRccStats;
 
@@ -2893,7 +2904,7 @@ namespace VMS.TPS
             {
                 var tabs = new TabControl();
 
-                var tabOriginal = new TabItem { Header = "Breast Optimiser", Content = BuildLayout(singleClickCellStyle) };
+                var tabOriginal = new TabItem { Header = "Generic", Content = BuildLayout(singleClickCellStyle) };
                 var tabRcc = new TabItem { Header = "RCC", Content = BuildRccLayout() };
 
                 tabs.Items.Add(tabOriginal);
@@ -3864,11 +3875,11 @@ namespace VMS.TPS
                 root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
                 root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 
-                // --- HEADER: title + falloff zone rates (PDF section 1) ---
+                // --- HEADER: title + objective + falloff zone rates (PDF section 1) ---
                 var header = new StackPanel { Orientation = Orientation.Vertical };
                 header.Children.Add(new TextBlock
                 {
-                    Text = "RCC Optimization Cropping Method – dose-falloff-driven PTV & ring cropping",
+                    Text = "RCC – automated PTV cropping from Rx dose + OAR max dose",
                     FontWeight = FontWeights.Bold,
                     FontSize = 14,
                     Margin = new Thickness(0, 0, 0, 4),
@@ -3876,7 +3887,9 @@ namespace VMS.TPS
                 });
                 header.Children.Add(new TextBlock
                 {
-                    Text = "Tick targets (with Rx) and OARs below, then Refresh Plan to preview the computed crops before creating structures.",
+                    Text = "Set each target's Rx and each OAR's Max Dose below. The falloff rate converts the dose gap into a crop " +
+                           "distance (Crop mm = %Diff / Zone A); the matrix shows that distance for every ticked pair, and " +
+                           "\"Auto-Crop PTVs from OARs\" applies it directly to create the cropped optimisation targets.",
                     Foreground = (Brush)FindResource("TextSecondary"),
                     Margin = new Thickness(0, 0, 0, 8),
                     TextWrapping = TextWrapping.Wrap
@@ -3893,14 +3906,14 @@ namespace VMS.TPS
                 Grid.SetRow(headerCard, 0);
                 root.Children.Add(headerCard);
 
-                // --- MIDDLE: left (target/OAR inputs) + right (computed plan) ---
+                // --- MIDDLE: left (Rx/Max-Dose inputs) + right (auto crop-distance matrix) ---
                 var mid = new Grid();
-                mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.85, GridUnitType.Star) });
+                mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.15, GridUnitType.Star) });
 
                 var leftStack = new StackPanel { Orientation = Orientation.Vertical };
 
-                leftStack.Children.Add(new TextBlock { Text = "Targets – tick + set Rx (Gy):", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 4) });
+                leftStack.Children.Add(new TextBlock { Text = "1) Targets – tick + set Rx (Gy):", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 4) });
                 _dgRccTargets = new DataGrid
                 {
                     ItemsSource = _rccTargetRows,
@@ -3935,7 +3948,7 @@ namespace VMS.TPS
                 });
                 leftStack.Children.Add(_dgRccTargets);
 
-                leftStack.Children.Add(new TextBlock { Text = "OARs – tick Max-Dose crop (§2) and/or Nested sparing (§7):", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 12, 0, 4) });
+                leftStack.Children.Add(new TextBlock { Text = "2) OARs – tick + set Max Dose (Gy):", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 12, 0, 4) });
                 _dgRccOars = new DataGrid
                 {
                     ItemsSource = _rccOarRows,
@@ -3954,12 +3967,12 @@ namespace VMS.TPS
                     ElementStyle = (Style)FindResource(typeof(TextBlock))
                 });
                 _dgRccOars.Columns.Add(MakeSingleClickCheckColumn(
-                    MakeHeaderCheckbox("Max-Dose", isChecked =>
+                    MakeHeaderCheckbox("Use", isChecked =>
                     {
                         foreach (var r in _rccOarRows) r.CropMaxDose = isChecked;
                         _dgRccOars.Items.Refresh();
                         RefreshRccPlan();
-                    }), "CropMaxDose", 75));
+                    }), "CropMaxDose", 50));
                 _dgRccOars.Columns.Add(new DataGridTextColumn
                 {
                     Header = "Max Dose (Gy)",
@@ -3969,12 +3982,12 @@ namespace VMS.TPS
                     EditingElementStyle = _inputTextBoxStyle
                 });
                 _dgRccOars.Columns.Add(MakeSingleClickCheckColumn(
-                    MakeHeaderCheckbox("Nested", isChecked =>
+                    MakeHeaderCheckbox("Nested (§7)", isChecked =>
                     {
                         foreach (var r in _rccOarRows) r.NestedSparing = isChecked;
                         _dgRccOars.Items.Refresh();
                         RefreshRccPlan();
-                    }), "NestedSparing", 75));
+                    }), "NestedSparing", 90));
                 leftStack.Children.Add(_dgRccOars);
 
                 var leftScroll = new ScrollViewer { Content = leftStack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
@@ -3982,26 +3995,42 @@ namespace VMS.TPS
                 Grid.SetColumn(leftCard, 0);
                 mid.Children.Add(leftCard);
 
+                // --- 3) Crop Distance Matrix: the core objective, auto-computed and
+                //     kept read-only so the number driving the crop is always visible
+                //     before "Auto-Crop PTVs from OARs" uses it. ---
                 var rightStack = new StackPanel { Orientation = Orientation.Vertical };
-                rightStack.Children.Add(new TextBlock { Text = "Computed plan (per cheat-sheet formulas):", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 4) });
+                rightStack.Children.Add(new TextBlock { Text = "3) Crop distance (auto, from Rx & Max Dose):", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 0, 4) });
+                rightStack.Children.Add(new TextBlock
+                {
+                    Text = "Crop (mm) = ((Rx − OAR Max) / Rx × 100) / Zone A.  \"–\" = OAR Max ≥ Rx, no crop needed.",
+                    Foreground = (Brush)FindResource("TextSecondary"),
+                    Margin = new Thickness(0, 0, 0, 6),
+                    TextWrapping = TextWrapping.Wrap
+                });
 
-                _dgRccPlan = new DataGrid
+                _dgRccMatrix = new DataGrid
                 {
                     AutoGenerateColumns = false,
                     CanUserAddRows = false,
                     IsReadOnly = true,
-                    HeadersVisibility = DataGridHeadersVisibility.Column
+                    HeadersVisibility = DataGridHeadersVisibility.Column,
+                    MaxHeight = 260
                 };
-                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Step", Binding = new Binding("Category"), Width = 130, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
-                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Source", Binding = new Binding("Source"), Width = new DataGridLength(1, DataGridLengthUnitType.Star), ElementStyle = (Style)FindResource(typeof(TextBlock)) });
-                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Zone", Binding = new Binding("Zone"), Width = 45, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
-                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "%Diff", Binding = new Binding("PctDiff") { StringFormat = "0.00" }, Width = 65, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
-                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Crop (mm)", Binding = new Binding("CropMm") { StringFormat = "0.00" }, Width = 80, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
-                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Result ID", Binding = new Binding("ResultId"), Width = 135, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
-                rightStack.Children.Add(_dgRccPlan);
+                rightStack.Children.Add(_dgRccMatrix);
 
-                _txtRccStats = new TextBlock { Margin = new Thickness(0, 8, 0, 0), Foreground = (Brush)FindResource("TextSecondary"), TextWrapping = TextWrapping.Wrap };
+                _txtRccStats = new TextBlock { Margin = new Thickness(0, 8, 0, 8), Foreground = (Brush)FindResource("TextSecondary"), TextWrapping = TextWrapping.Wrap };
                 rightStack.Children.Add(_txtRccStats);
+
+                var autoCropBar = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+                var btnRefresh = new Button { Content = "Refresh", Padding = new Thickness(15, 6, 15, 6), Margin = new Thickness(0, 0, 6, 0) };
+                btnRefresh.Click += (s, e) => RefreshRccPlan();
+                autoCropBar.Children.Add(btnRefresh);
+
+                var btnAutoCrop = new Button { Content = "Auto-Crop PTVs from OARs", Padding = new Thickness(20, 8, 20, 8) };
+                btnAutoCrop.SetResourceReference(FrameworkElement.StyleProperty, "PrimaryButton");
+                btnAutoCrop.Click += (s, e) => DoRccAutoCrop();
+                autoCropBar.Children.Add(btnAutoCrop);
+                rightStack.Children.Add(autoCropBar);
 
                 var rightCard = CreateCard(rightStack);
                 Grid.SetColumn(rightCard, 1);
@@ -4010,32 +4039,54 @@ namespace VMS.TPS
                 Grid.SetRow(mid, 1);
                 root.Children.Add(mid);
 
-                // --- BOTTOM: action buttons ---
-                var bottom = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+                // --- ADVANCED (optional): SIB shave / variable rings / nested sparing ---
+                var advStack = new StackPanel { Orientation = Orientation.Vertical };
+                advStack.Children.Add(new TextBlock
+                {
+                    Text = "Advanced (optional) – SIB shave (§3), variable rings (§4/§5), nested OAR sparing (§7)",
+                    FontWeight = FontWeights.Bold,
+                    Foreground = (Brush)FindResource("TextSecondary"),
+                    Margin = new Thickness(0, 0, 0, 6)
+                });
 
-                var btnRefresh = new Button { Content = "Refresh Plan", Padding = new Thickness(15, 6, 15, 6), Margin = new Thickness(0, 0, 6, 0) };
-                btnRefresh.Click += (s, e) => RefreshRccPlan();
-                bottom.Children.Add(btnRefresh);
+                _dgRccPlan = new DataGrid
+                {
+                    AutoGenerateColumns = false,
+                    CanUserAddRows = false,
+                    IsReadOnly = true,
+                    HeadersVisibility = DataGridHeadersVisibility.Column,
+                    MaxHeight = 160
+                };
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Step", Binding = new Binding("Category"), Width = 130, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Source", Binding = new Binding("Source"), Width = new DataGridLength(1, DataGridLengthUnitType.Star), ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Zone", Binding = new Binding("Zone"), Width = 45, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "%Diff", Binding = new Binding("PctDiff") { StringFormat = "0.00" }, Width = 65, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Crop (mm)", Binding = new Binding("CropMm") { StringFormat = "0.00" }, Width = 80, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Result ID", Binding = new Binding("ResultId"), Width = 135, ElementStyle = (Style)FindResource(typeof(TextBlock)) });
+                advStack.Children.Add(_dgRccPlan);
 
-                var btnCreate = new Button { Content = "Create RCC Structures", Padding = new Thickness(20, 8, 20, 8) };
-                btnCreate.SetResourceReference(FrameworkElement.StyleProperty, "PrimaryButton");
-                btnCreate.Click += (s, e) => DoRccCreate();
-                bottom.Children.Add(btnCreate);
+                var advBar = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 8, 0, 0) };
+                var btnAdvCreate = new Button { Content = "Create SIB / Ring / Nested Structures", Padding = new Thickness(15, 6, 15, 6) };
+                btnAdvCreate.SetResourceReference(FrameworkElement.StyleProperty, "WarningButton");
+                btnAdvCreate.Click += (s, e) => DoRccAdvancedCreate();
+                advBar.Children.Add(btnAdvCreate);
+                advStack.Children.Add(advBar);
 
-                var bottomCard = CreateCard(bottom);
-                Grid.SetRow(bottomCard, 2);
-                root.Children.Add(bottomCard);
+                var advCard = CreateCard(advStack);
+                Grid.SetRow(advCard, 2);
+                root.Children.Add(advCard);
 
                 RefreshRccPlan();
                 return root;
             }
 
             // Recomputes the RCC plan from current ticks/Rx/MaxDose/zone-rate inputs
-            // and repopulates the read-only preview grid. Called on every relevant
-            // edit so the preview always matches what "Create RCC Structures" will do.
+            // and repopulates both the crop-distance matrix (primary objective) and
+            // the advanced SIB/ring/nested preview grid. Called on every relevant edit
+            // so what's shown always matches what the action buttons will do.
             private void RefreshRccPlan()
             {
-                if (_dgRccPlan == null) return;
+                if (_dgRccMatrix == null || _dgRccPlan == null) return;
 
                 _dgRccTargets?.CommitEdit(DataGridEditingUnit.Cell, true);
                 _dgRccTargets?.CommitEdit(DataGridEditingUnit.Row, true);
@@ -4043,18 +4094,9 @@ namespace VMS.TPS
                 _dgRccOars?.CommitEdit(DataGridEditingUnit.Row, true);
 
                 _rccPlan = ComputeRccPlan();
-                var rows = new List<RccPlanRow>();
+                RefreshRccMatrix();
 
-                foreach (var c in _rccPlan.MaxDoseCrops)
-                    rows.Add(new RccPlanRow
-                    {
-                        Category = "zPTV Opti (§2)",
-                        Source = $"{c.Target.TargetId} vs {c.Oar.OarId} (max {c.Oar.ParsedMaxDoseGy:0.##} Gy)",
-                        Zone = "A",
-                        PctDiff = c.PctDiff,
-                        CropMm = c.CropMm,
-                        ResultId = c.ResultId
-                    });
+                var rows = new List<RccPlanRow>();
 
                 foreach (var sh in _rccPlan.SibShaves)
                     rows.Add(new RccPlanRow
@@ -4097,11 +4139,87 @@ namespace VMS.TPS
                 }
 
                 _dgRccPlan.ItemsSource = rows;
+            }
 
-                _txtRccStats.Text = $"Planned rows: {rows.Count}" +
-                    (_rccPlan.LowestSibRxGy.HasValue
-                        ? $"   |   Ring1 target dose = {_rccPlan.Ring1TargetDoseGy:0.##} Gy (85% x {_rccPlan.LowestSibRxGy:0.##} Gy)   |   Ring2 target dose = {_rccPlan.Ring2TargetDoseGy:0.##} Gy (65% x {_rccPlan.LowestSibRxGy:0.##} Gy)"
-                        : "");
+            // Rebuilds the read-only "Crop Distance Matrix" – one row per ticked OAR,
+            // one column per ticked target, cell = auto-computed crop mm (or "–" if
+            // that OAR's Max Dose does not require sparing this target's Rx). This is
+            // the number "Auto-Crop PTVs from OARs" applies, shown before it's used.
+            private void RefreshRccMatrix()
+            {
+                double zoneA = ParseRateOrDefault(_txtRccZoneA, RCC_ZONE_A_DEFAULT_PCT_PER_MM);
+                var tickedTargets = _rccTargetRows
+                    .Where(r => r.IsSelected && r.ParsedRxGy.HasValue && r.ParsedRxGy.Value > 0)
+                    .ToList();
+                var tickedOars = _rccOarRows.Where(r => r.CropMaxDose).ToList();
+
+                var matrixRows = new List<RccMatrixRow>();
+                foreach (var oar in tickedOars)
+                {
+                    var row = new RccMatrixRow
+                    {
+                        OarId = oar.OarId,
+                        MaxDoseDisplay = oar.ParsedMaxDoseGy.HasValue
+                            ? oar.ParsedMaxDoseGy.Value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) + " Gy"
+                            : "(set)",
+                        CropDisplay = new string[tickedTargets.Count]
+                    };
+
+                    for (int i = 0; i < tickedTargets.Count; i++)
+                    {
+                        var t = tickedTargets[i];
+                        if (!oar.ParsedMaxDoseGy.HasValue) { row.CropDisplay[i] = "–"; continue; }
+
+                        double rx = t.ParsedRxGy.Value;
+                        double oarMax = oar.ParsedMaxDoseGy.Value;
+                        if (oarMax >= rx) { row.CropDisplay[i] = "–"; continue; }
+
+                        double pctDiff = RccPctDiff(rx, oarMax);
+                        double cropMm = RccCropMm(pctDiff, zoneA);
+                        row.CropDisplay[i] = cropMm > 0
+                            ? cropMm.ToString("0.0", System.Globalization.CultureInfo.InvariantCulture) + " mm"
+                            : "–";
+                    }
+                    matrixRows.Add(row);
+                }
+
+                _dgRccMatrix.Columns.Clear();
+                _dgRccMatrix.Columns.Add(new DataGridTextColumn
+                {
+                    Header = "OAR",
+                    Binding = new Binding("OarId"),
+                    IsReadOnly = true,
+                    Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                    ElementStyle = (Style)FindResource(typeof(TextBlock))
+                });
+                _dgRccMatrix.Columns.Add(new DataGridTextColumn
+                {
+                    Header = "Max Dose",
+                    Binding = new Binding("MaxDoseDisplay"),
+                    IsReadOnly = true,
+                    Width = 90,
+                    ElementStyle = (Style)FindResource(typeof(TextBlock))
+                });
+                for (int i = 0; i < tickedTargets.Count; i++)
+                {
+                    string tid = tickedTargets[i].TargetId;
+                    string headerName = tid.Length > 10 ? tid.Substring(0, 10) + ".." : tid;
+                    _dgRccMatrix.Columns.Add(new DataGridTextColumn
+                    {
+                        Header = headerName + " crop",
+                        Binding = new Binding($"CropDisplay[{i}]"),
+                        IsReadOnly = true,
+                        Width = 90,
+                        ElementStyle = (Style)FindResource(typeof(TextBlock))
+                    });
+                }
+                _dgRccMatrix.ItemsSource = matrixRows;
+
+                int applicablePairs = _rccPlan?.MaxDoseCrops.Count ?? 0;
+                int targetsToCrop = _rccPlan?.MaxDoseCrops.Select(c => c.Target.TargetId).Distinct(StringComparer.OrdinalIgnoreCase).Count() ?? 0;
+                _txtRccStats.Text = tickedTargets.Count == 0 || tickedOars.Count == 0
+                    ? "Tick at least one target (with Rx) and one OAR (with Max Dose) to compute crop distances."
+                    : $"{applicablePairs} target/OAR pair(s) need cropping -> {targetsToCrop} PTV(s) will be auto-cropped.";
             }
 
             // Pure formula engine – no ESAPI calls here, only the PDF cheat-sheet math.
@@ -4190,8 +4308,15 @@ namespace VMS.TPS
                 return plan;
             }
 
-            // Executes the current RccPlan against the live StructureSet.
-            private void DoRccCreate()
+            // ------------------------------------------------------------
+            // PRIMARY OBJECTIVE: Rx (PTV) + Max Dose (OAR) -> crop distance
+            // (the matrix above) -> automated cropping (this method).
+            // A target with several ticked OARs gets ONE cropped structure:
+            // each OAR is expanded by its own computed distance first, then
+            // all expansions are unioned before the single subtraction from
+            // the target, so every applicable OAR's crop is honoured at once.
+            // ------------------------------------------------------------
+            private void DoRccAutoCrop()
             {
                 RefreshRccPlan();
                 var plan = _rccPlan;
@@ -4205,11 +4330,10 @@ namespace VMS.TPS
                     return;
                 }
 
-                if (plan.MaxDoseCrops.Count == 0 && plan.SibShaves.Count == 0 &&
-                    plan.Ring1Levels.Count == 0 && plan.NestedRings.Count == 0)
+                if (plan.MaxDoseCrops.Count == 0)
                 {
                     MessageBox.Show(this,
-                        "Nothing to create – tick targets/OARs and set Rx / Max Dose values first.",
+                        "Nothing to crop – tick at least one target (with Rx) and one OAR whose Max Dose is below that Rx.",
                         "Nothing selected", MessageBoxButton.OK, MessageBoxImage.Warning);
                     return;
                 }
@@ -4218,40 +4342,97 @@ namespace VMS.TPS
                 var created = new List<string>();
                 var errors = new List<string>();
 
-                // ---- Section 2: zPTV Opti (Max-Dose OAR crop) ----
-                foreach (var c in plan.MaxDoseCrops)
+                foreach (var grp in plan.MaxDoseCrops.GroupBy(c => c.Target.TargetId, StringComparer.OrdinalIgnoreCase))
                 {
+                    string resultId = grp.First().ResultId;
                     try
                     {
-                        var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, c.Target.TargetId, StringComparison.OrdinalIgnoreCase));
-                        var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, c.Oar.OarId, StringComparison.OrdinalIgnoreCase));
-                        if (targetSt == null || oarSt == null) { errors.Add($"{c.ResultId}: source structure missing"); continue; }
+                        var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, grp.Key, StringComparison.OrdinalIgnoreCase));
+                        if (targetSt == null) { errors.Add($"{resultId}: target structure missing"); continue; }
 
                         using (var tg = new TempGuard(_ss))
                         {
-                            var expandedOar = SafeMargin(oarSt.SegmentVolume, c.CropMm);
-                            var expandedOarSt = tg.Add(CreateTempFromSegment(_ss, expandedOar, "zRCC_ExpOar"));
+                            var expandedOarTemps = new List<Structure>();
+                            var pairLabels = new List<string>();
 
-                            var croppedSeg = SafeBoolean(_ss, targetSt.SegmentVolume, expandedOar, BoolOp.Sub,
-                                targetSt, expandedOarSt, c.ResultId, fb, $"RccOpti_{c.ResultId}_Sub", tg);
+                            foreach (var c in grp)
+                            {
+                                var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, c.Oar.OarId, StringComparison.OrdinalIgnoreCase));
+                                if (oarSt == null) { errors.Add($"{resultId}: OAR '{c.Oar.OarId}' missing"); continue; }
+
+                                var expanded = SafeMargin(oarSt.SegmentVolume, c.CropMm);
+                                expandedOarTemps.Add(tg.Add(CreateTempFromSegment(_ss, expanded, "zRCC_ExpOar")));
+                                pairLabels.Add($"{c.Oar.OarId}({c.CropMm:0.0}mm)");
+                            }
+                            if (expandedOarTemps.Count == 0) continue;
+
+                            var oarsUnionSt = tg.Add(UnionManyToTemp(_ss, expandedOarTemps, fb, "zRCC_OarsU", $"RccOarsUnion_{resultId}", tg));
+                            if (oarsUnionSt == null) continue;
+
+                            var croppedSeg = SafeBoolean(_ss, targetSt.SegmentVolume, oarsUnionSt.SegmentVolume, BoolOp.Sub,
+                                targetSt, oarsUnionSt, resultId, fb, $"RccOpti_{resultId}_Sub", tg);
                             croppedSeg = SafeBoolean(_ss, croppedSeg, ext.SegmentVolume, BoolOp.And,
-                                null, ext, c.ResultId, fb, $"RccOpti_{c.ResultId}_CapExt", tg);
+                                null, ext, resultId, fb, $"RccOpti_{resultId}_CapExt", tg);
 
-                            var st = GetOrCreate(_ss, "PTV", c.ResultId);
+                            var st = GetOrCreate(_ss, "PTV", resultId);
                             if (AssignSegmentSafely(st, croppedSeg))
                             {
                                 st.Color = Color.FromRgb(255, 165, 0);
-                                created.Add(c.ResultId);
+                                created.Add($"{resultId}  <-  {string.Join(", ", pairLabels)}");
                             }
                             else
                             {
                                 _ss.RemoveStructure(st);
-                                errors.Add($"{c.ResultId}: empty result");
+                                errors.Add($"{resultId}: empty result");
                             }
                         }
                     }
-                    catch (Exception ex) { errors.Add($"{c.ResultId}: {ex.Message}"); }
+                    catch (Exception ex) { errors.Add($"{resultId}: {ex.Message}"); }
                 }
+
+                var summary = new StringBuilder();
+                summary.AppendLine($"Auto-cropped {created.Count} PTV(s):");
+                foreach (var id in created) summary.AppendLine($"  {id}");
+                if (errors.Count > 0)
+                {
+                    summary.AppendLine();
+                    summary.AppendLine($"Errors ({errors.Count}):");
+                    foreach (var err in errors) summary.AppendLine($"  {err}");
+                }
+                MessageBox.Show(this, summary.ToString(), "RCC Auto-Crop", MessageBoxButton.OK,
+                    errors.Count > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+
+                RefreshRccPlan();
+            }
+
+            // Advanced/optional formulas from the same cheat sheet (SIB shave,
+            // variable rings, nested OAR sparing) – separate from the primary
+            // Rx+MaxDose auto-crop objective above.
+            private void DoRccAdvancedCreate()
+            {
+                RefreshRccPlan();
+                var plan = _rccPlan;
+                if (plan == null) return;
+
+                var ext = _vm.SelectedExternal ?? FindExternalFallback(_ss);
+                if (ext == null || ext.IsEmpty)
+                {
+                    MessageBox.Show(this, "No External/Body structure selected.",
+                        "Missing External", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                if (plan.SibShaves.Count == 0 && plan.Ring1Levels.Count == 0 && plan.NestedRings.Count == 0)
+                {
+                    MessageBox.Show(this,
+                        "Nothing to create – tick 2+ targets for SIB shave/rings, and/or tick Nested OARs for §7.",
+                        "Nothing selected", MessageBoxButton.OK, MessageBoxImage.Warning);
+                    return;
+                }
+
+                var fb = new SliceRecontourFallback();
+                var created = new List<string>();
+                var errors = new List<string>();
 
                 // ---- Section 3: SIB shave (zPTVLow Opti) ----
                 foreach (var sh in plan.SibShaves)
@@ -4434,7 +4615,7 @@ namespace VMS.TPS
                 }
 
                 var msg = new StringBuilder();
-                msg.AppendLine($"RCC structures created/updated: {created.Count}");
+                msg.AppendLine($"Advanced RCC structures created/updated: {created.Count}");
                 foreach (var id in created) msg.AppendLine($"  {id}");
                 if (errors.Count > 0)
                 {
@@ -4442,8 +4623,10 @@ namespace VMS.TPS
                     msg.AppendLine($"Errors ({errors.Count}):");
                     foreach (var err in errors) msg.AppendLine($"  {err}");
                 }
-                MessageBox.Show(this, msg.ToString(), "RCC Structures", MessageBoxButton.OK,
+                MessageBox.Show(this, msg.ToString(), "RCC Advanced Structures", MessageBoxButton.OK,
                     errors.Count > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
+
+                RefreshRccPlan();
             }
         }
     }
