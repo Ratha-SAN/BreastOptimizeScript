@@ -3929,20 +3929,21 @@ namespace VMS.TPS
                         foreach (var r in _rccTargetRows) r.IsSelected = isChecked;
                         _dgRccTargets.Items.Refresh();
                         RefreshRccPlan();
-                    }), "IsSelected", 55));
+                    }), "IsSelected", 60));
                 _dgRccTargets.Columns.Add(new DataGridTextColumn
                 {
                     Header = "Target",
                     Binding = new Binding("TargetId"),
                     IsReadOnly = true,
                     Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                    MinWidth = 90,
                     ElementStyle = (Style)FindResource(typeof(TextBlock))
                 });
                 _dgRccTargets.Columns.Add(new DataGridTextColumn
                 {
                     Header = "Rx (Gy)",
                     Binding = new Binding("RxGy") { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
-                    Width = 90,
+                    Width = 70,
                     ElementStyle = _inputTextBlockStyle,
                     EditingElementStyle = _inputTextBoxStyle
                 });
@@ -3964,6 +3965,7 @@ namespace VMS.TPS
                     Binding = new Binding("OarId"),
                     IsReadOnly = true,
                     Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                    MinWidth = 90,
                     ElementStyle = (Style)FindResource(typeof(TextBlock))
                 });
                 _dgRccOars.Columns.Add(MakeSingleClickCheckColumn(
@@ -3972,22 +3974,22 @@ namespace VMS.TPS
                         foreach (var r in _rccOarRows) r.CropMaxDose = isChecked;
                         _dgRccOars.Items.Refresh();
                         RefreshRccPlan();
-                    }), "CropMaxDose", 50));
+                    }), "CropMaxDose", 60));
                 _dgRccOars.Columns.Add(new DataGridTextColumn
                 {
-                    Header = "Max Dose (Gy)",
+                    Header = "Max Dose",
                     Binding = new Binding("MaxDoseGy") { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
-                    Width = 105,
+                    Width = 85,
                     ElementStyle = _inputTextBlockStyle,
                     EditingElementStyle = _inputTextBoxStyle
                 });
                 _dgRccOars.Columns.Add(MakeSingleClickCheckColumn(
-                    MakeHeaderCheckbox("Nested (§7)", isChecked =>
+                    MakeHeaderCheckbox("Nested", isChecked =>
                     {
                         foreach (var r in _rccOarRows) r.NestedSparing = isChecked;
                         _dgRccOars.Items.Refresh();
                         RefreshRccPlan();
-                    }), "NestedSparing", 90));
+                    }), "NestedSparing", 78));
                 leftStack.Children.Add(_dgRccOars);
 
                 var leftScroll = new ScrollViewer { Content = leftStack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
@@ -4190,6 +4192,7 @@ namespace VMS.TPS
                     Binding = new Binding("OarId"),
                     IsReadOnly = true,
                     Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                    MinWidth = 90,
                     ElementStyle = (Style)FindResource(typeof(TextBlock))
                 });
                 _dgRccMatrix.Columns.Add(new DataGridTextColumn
@@ -4197,7 +4200,7 @@ namespace VMS.TPS
                     Header = "Max Dose",
                     Binding = new Binding("MaxDoseDisplay"),
                     IsReadOnly = true,
-                    Width = 90,
+                    Width = 80,
                     ElementStyle = (Style)FindResource(typeof(TextBlock))
                 });
                 for (int i = 0; i < tickedTargets.Count; i++)
